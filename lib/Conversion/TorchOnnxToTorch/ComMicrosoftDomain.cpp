@@ -1531,4 +1531,237 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
                                                           c);
         return success();
       });
+  patterns.onOp(
+      "QGemm", 1, [](OpBinder binder, ConversionPatternRewriter &rewriter) {
+        // Y = alpha * (A' * B' + C'), where A' and B' are the dequantized,
+        // optionally transposed inputs and C' is the optional int32 bias with
+        // scale a_scale * b_scale and zero point 0. As in onnxruntime, the
+        // bias joins the int32 accumulator and alpha scales the sum. Y is
+        // requantized with (y_scale, y_zero_point) when both are given and is
+        // f32 when both are absent.
+        Location loc = binder.getLoc();
+        Torch::ValueTensorType resultType;
+        Value a, aScale, aZp, b, bScale, bZp;
+        float alpha;
+        int64_t transA, transB;
+        if (binder.tensorOperandAtIndex(a, 0) ||
+            binder.tensorOperandAtIndex(aScale, 1) ||
+            binder.tensorOperandAtIndex(aZp, 2) ||
+            binder.tensorOperandAtIndex(b, 3) ||
+            binder.tensorOperandAtIndex(bScale, 4) ||
+            binder.tensorOperandAtIndex(bZp, 5) ||
+            binder.tensorResultType(resultType) ||
+            binder.f32FloatAttr(alpha, "alpha", 1.0f) ||
+            binder.s64IntegerAttr(transA, "transA", 0) ||
+            binder.s64IntegerAttr(transB, "transB", 0))
+          return failure();
+
+        // Optional inputs keep their positions: an absent one is either
+        // missing from the end of the operand list or a `none` operand.
+        Value c, yScale, yZp;
+        bool hasC = succeeded(binder.tensorOperandAtIndex(c, 6));
+        bool hasYScale = succeeded(binder.tensorOperandAtIndex(yScale, 7));
+        bool hasYZp = succeeded(binder.tensorOperandAtIndex(yZp, 8));
+        if (hasYScale != hasYZp)
+          return rewriter.notifyMatchFailure(
+              binder.op, "Unimplemented: y_scale and y_zero_point must be "
+                         "both present or both absent");
+        if (!resultType.hasDtype() ||
+            (hasYScale ? !resultType.getDtype().isInteger(8)
+                       : !resultType.getDtype().isF32()))
+          return rewriter.notifyMatchFailure(
+              binder.op, "Expected an 8-bit result with y_scale and "
+                         "y_zero_point, or an f32 result without them");
+
+        auto aTy = cast<Torch::ValueTensorType>(a.getType());
+        auto bTy = cast<Torch::ValueTensorType>(b.getType());
+        if (!aTy.hasSizes() || !bTy.hasSizes() || !aTy.hasDtype() ||
+            !bTy.hasDtype() || aTy.getSizes().size() != 2 ||
+            bTy.getSizes().size() != 2 || !aTy.getDtype().isInteger(8) ||
+            !bTy.getDtype().isInteger(8))
+          return rewriter.notifyMatchFailure(
+              binder.op, "Expected 2-D 8-bit integer inputs A and B");
+        if (hasC) {
+          auto cTy = cast<Torch::ValueTensorType>(c.getType());
+          if (!cTy.hasSizes() || !cTy.hasDtype() ||
+              !cTy.getDtype().isSignedInteger(32))
+            return rewriter.notifyMatchFailure(binder.op,
+                                               "Expected an si32 bias C");
+        }
+
+        auto transpose = [&](Value v) -> Value {
+          auto vTy = cast<Torch::ValueTensorType>(v.getType());
+          ArrayRef<int64_t> sizes = vTy.getSizes();
+          auto tTy = rewriter.getType<Torch::ValueTensorType>(
+              ArrayRef<int64_t>{sizes[1], sizes[0]}, vTy.getOptionalDtype());
+          Value dim0 = Torch::ConstantIntOp::create(
+              rewriter, loc, rewriter.getI64IntegerAttr(0));
+          Value dim1 = Torch::ConstantIntOp::create(
+              rewriter, loc, rewriter.getI64IntegerAttr(1));
+          return Torch::AtenTransposeIntOp::create(rewriter, loc, tTy, v, dim0,
+                                                   dim1);
+        };
+        if (transA)
+          a = transpose(a);
+        if (transB)
+          b = transpose(b);
+
+        Value aScaleVal, aZpVal;
+        if (failed(extractPerTensorQuantizationArguments(
+                rewriter, loc, aScale, aZp, aScaleVal, aZpVal)))
+          return rewriter.notifyMatchFailure(
+              binder.op, "Expected per-tensor quantization for A");
+
+        // B is quantized per tensor or per column (one scale per column of
+        // B'); b_zero_point is a scalar or one value per column.
+        auto bScaleTy = cast<Torch::ValueTensorType>(bScale.getType());
+        auto bZpTy = cast<Torch::ValueTensorType>(bZp.getType());
+        if (!bScaleTy.hasSizes() || !bZpTy.hasSizes())
+          return rewriter.notifyMatchFailure(
+              binder.op, "Expected b_scale and b_zero_point to have sizes");
+        int64_t n = cast<Torch::ValueTensorType>(b.getType()).getSizes()[1];
+        auto isScalar = [](ArrayRef<int64_t> sizes) {
+          return llvm::all_of(sizes, [](int64_t s) { return s == 1; });
+        };
+        auto isPerColumn = [&](ArrayRef<int64_t> sizes) {
+          return sizes.size() == 1 && n != Torch::kUnknownSize && sizes[0] == n;
+        };
+        bool bPerTensor =
+            isScalar(bScaleTy.getSizes()) && isScalar(bZpTy.getSizes());
+        if (!bPerTensor &&
+            (!isPerColumn(bScaleTy.getSizes()) ||
+             !(isScalar(bZpTy.getSizes()) || isPerColumn(bZpTy.getSizes()))))
+          return rewriter.notifyMatchFailure(
+              binder.op, "Unimplemented: b_scale and b_zero_point must be "
+                         "per-tensor or per-column");
+
+        auto yTy = rewriter.getType<Torch::ValueTensorType>(
+            resultType.getOptionalSizes(), rewriter.getF32Type());
+        Value y;
+        if (bPerTensor) {
+          Value bScaleVal, bZpVal;
+          if (failed(extractPerTensorQuantizationArguments(
+                  rewriter, loc, bScale, bZp, bScaleVal, bZpVal)))
+            return rewriter.notifyMatchFailure(
+                binder.op, "Expected per-tensor quantization for B");
+
+          // A ui8 operand becomes si8 with its zero point lowered by 128,
+          // which leaves (x - zero_point) unchanged; aten.mm then sees qint8
+          // operands only.
+          auto *ctx = binder.op->getContext();
+          auto si8Type = IntegerType::get(ctx, 8, IntegerType::Signed);
+          auto si32Type = IntegerType::get(ctx, 32, IntegerType::Signed);
+          auto toSigned = [&](Value &v, Value &zp) {
+            auto vTy = cast<Torch::ValueTensorType>(v.getType());
+            if (!vTy.getDtype().isUnsignedInteger(8))
+              return;
+            Value cst128 = Torch::ConstantIntOp::create(
+                rewriter, loc, rewriter.getI64IntegerAttr(128));
+            Value cstOne = Torch::ConstantIntOp::create(
+                rewriter, loc, rewriter.getI64IntegerAttr(1));
+            Value wide =
+                Torch::convertTensorToDtype(rewriter, loc, v, si32Type);
+            wide = Torch::AtenSubScalarOp::create(rewriter, loc, wide.getType(),
+                                                  wide, cst128, cstOne);
+            v = Torch::convertTensorToDtype(rewriter, loc, wide, si8Type);
+            zp = Torch::AtenSubIntOp::create(
+                rewriter, loc, rewriter.getType<Torch::IntType>(), zp, cst128);
+          };
+          toSigned(a, aZpVal);
+          toSigned(b, bZpVal);
+
+          auto makePerTensor = [&](Value v, Value scale, Value zp) -> Value {
+            return Torch::Aten_MakePerTensorQuantizedTensorOp::create(
+                rewriter, loc, getQTorchTypeFromTorchIntType(v.getType()), v,
+                scale, zp);
+          };
+          a = makePerTensor(a, aScaleVal, aZpVal);
+          b = makePerTensor(b, bScaleVal, bZpVal);
+
+          auto accTy = rewriter.getType<Torch::ValueTensorType>(
+              resultType.getOptionalSizes(), si32Type);
+          Value acc = Torch::AtenMmOp::create(rewriter, loc, accTy, a, b);
+          if (hasC) {
+            Value cstOne = Torch::ConstantIntOp::create(
+                rewriter, loc, rewriter.getI64IntegerAttr(1));
+            acc = Torch::AtenAddTensorOp::create(rewriter, loc, accTy, acc, c,
+                                                 cstOne);
+          }
+          Value accScale = Torch::AtenMulFloatOp::create(
+              rewriter, loc, rewriter.getType<Torch::FloatType>(), aScaleVal,
+              bScaleVal);
+          Value accZp = Torch::ConstantIntOp::create(
+              rewriter, loc, rewriter.getI64IntegerAttr(0));
+          acc = makePerTensor(acc, accScale, accZp);
+          y = Torch::AtenDequantizeSelfOp::create(rewriter, loc, yTy, acc);
+        } else {
+          // Per-column b_scale: multiply the dequantized inputs, as
+          // QLinearMatMul does, since the quantized matmul downstream is
+          // per tensor only.
+          Value none = Torch::ConstantNoneOp::create(rewriter, loc);
+          Value cstFalse = Torch::ConstantBoolOp::create(rewriter, loc, false);
+          Value f32Dtype = Torch::ConstantIntOp::create(
+              rewriter, loc, rewriter.getI64IntegerAttr(/*float32=*/6));
+          Value cstOne = Torch::ConstantFloatOp::create(
+              rewriter, loc, rewriter.getF64FloatAttr(1.0));
+          auto toF32 = [&](Value v) -> Value {
+            auto vTy = cast<Torch::ValueTensorType>(v.getType());
+            auto fTy = rewriter.getType<Torch::ValueTensorType>(
+                vTy.getSizes(), rewriter.getF32Type());
+            return Torch::AtenToDtypeOp::create(rewriter, loc, fTy, v, f32Dtype,
+                                                /*non_blocking=*/cstFalse,
+                                                /*copy=*/cstFalse,
+                                                /*memory_format=*/none);
+          };
+          a = toF32(a);
+          a = Torch::AtenSubScalarOp::create(rewriter, loc, a.getType(), a,
+                                             aZpVal, cstOne);
+          a = Torch::AtenMulScalarOp::create(rewriter, loc, a.getType(), a,
+                                             aScaleVal);
+          b = toF32(b);
+          b = Torch::AtenSubTensorOp::create(rewriter, loc, b.getType(), b, bZp,
+                                             cstOne);
+          b = Torch::AtenMulTensorOp::create(rewriter, loc, b.getType(), b,
+                                             bScale);
+          y = Torch::AtenMmOp::create(rewriter, loc, yTy, a, b);
+          if (hasC) {
+            Value cDequant = toF32(c);
+            cDequant = Torch::AtenMulScalarOp::create(
+                rewriter, loc, cDequant.getType(), cDequant, aScaleVal);
+            cDequant = Torch::AtenMulTensorOp::create(
+                rewriter, loc, cDequant.getType(), cDequant, bScale);
+            y = Torch::AtenAddTensorOp::create(rewriter, loc, yTy, y, cDequant,
+                                               cstOne);
+          }
+        }
+
+        if (alpha != 1.0f) {
+          Value alphaVal = Torch::ConstantFloatOp::create(
+              rewriter, loc, rewriter.getF64FloatAttr(alpha));
+          y = Torch::AtenMulScalarOp::create(rewriter, loc, yTy, y, alphaVal);
+        }
+
+        if (!hasYScale) {
+          rewriter.replaceOp(binder.op, y);
+          return success();
+        }
+
+        Value yScaleVal, yZpVal;
+        if (failed(extractPerTensorQuantizationArguments(
+                rewriter, loc, yScale, yZp, yScaleVal, yZpVal)))
+          return rewriter.notifyMatchFailure(
+              binder.op, "Expected per-tensor quantization for Y");
+        auto yQTy = getQTorchTypeFromTorchIntType(resultType);
+        Value dtyVal = Torch::ConstantIntOp::create(
+            rewriter, loc, rewriter.getType<Torch::IntType>(),
+            rewriter.getIntegerAttr(
+                rewriter.getIntegerType(64),
+                static_cast<int64_t>(
+                    Torch::getScalarTypeForType(yQTy.getDtype()))));
+        y = Torch::AtenQuantizePerTensorOp::create(rewriter, loc, yQTy, y,
+                                                   yScaleVal, yZpVal, dtyVal);
+        rewriter.replaceOpWithNewOp<Torch::AtenIntReprOp>(binder.op, resultType,
+                                                          y);
+        return success();
+      });
 }
