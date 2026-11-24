@@ -567,7 +567,6 @@ void mlir::torch::onnx_c::populateDefaultDomainQtoZ(
         for (auto namedAttr : binder.op->getAttrDictionary()) {
           if (namedAttr.getName().getValue().compare("name") == 0)
             continue;
-          llvm::errs() << namedAttr.getName() << "\n";
           newAttributes.push_back(namedAttr);
         }
 

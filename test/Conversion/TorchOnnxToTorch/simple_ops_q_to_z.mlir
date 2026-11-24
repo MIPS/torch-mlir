@@ -152,6 +152,146 @@ func.func @test_quantizelinear_per_channel_si32(%arg0: !torch.vtensor<[4,3,7,7],
 
 // -----
 
+// CHECK-LABEL: @test_qgemm_s8s8
+func.func @test_qgemm_s8s8(%arg0: !torch.vtensor<[2,4],si8>, %arg1: !torch.vtensor<[],f32>, %arg2: !torch.vtensor<[],si8>, %arg3: !torch.vtensor<[4,3],si8>, %arg4: !torch.vtensor<[],f32>, %arg5: !torch.vtensor<[],si8>, %arg6: !torch.vtensor<[3],si32>, %arg7: !torch.vtensor<[],f32>, %arg8: !torch.vtensor<[],si8>) -> !torch.vtensor<[2,3],si8> attributes {torch.onnx_meta.opset_version = 10 : si64} {
+  %0 = torch.operator "onnx.QGemm"(%arg0, %arg1, %arg2, %arg3, %arg4, %arg5, %arg6, %arg7, %arg8) : (!torch.vtensor<[2,4],si8>, !torch.vtensor<[],f32>, !torch.vtensor<[],si8>, !torch.vtensor<[4,3],si8>, !torch.vtensor<[],f32>, !torch.vtensor<[],si8>, !torch.vtensor<[3],si32>, !torch.vtensor<[],f32>, !torch.vtensor<[],si8>) -> !torch.vtensor<[2,3],si8>
+  // CHECK-DAG: %[[ASCALE:.+]] = torch.aten.item %arg1 : !torch.vtensor<[],f32> -> !torch.float
+  // CHECK-DAG: %[[AZP:.+]] = torch.aten.item %arg2 : !torch.vtensor<[],si8> -> !torch.int
+  // CHECK-DAG: %[[BSCALE:.+]] = torch.aten.item %arg4 : !torch.vtensor<[],f32> -> !torch.float
+  // CHECK-DAG: %[[BZP:.+]] = torch.aten.item %arg5 : !torch.vtensor<[],si8> -> !torch.int
+  // CHECK: %[[A:.+]] = torch.aten._make_per_tensor_quantized_tensor %arg0, %[[ASCALE]], %[[AZP]] : !torch.vtensor<[2,4],si8>, !torch.float, !torch.int -> !torch.vtensor<[2,4],!torch.qint8>
+  // CHECK: %[[B:.+]] = torch.aten._make_per_tensor_quantized_tensor %arg3, %[[BSCALE]], %[[BZP]] : !torch.vtensor<[4,3],si8>, !torch.float, !torch.int -> !torch.vtensor<[4,3],!torch.qint8>
+  // CHECK: %[[MM:.+]] = torch.aten.mm %[[A]], %[[B]] : !torch.vtensor<[2,4],!torch.qint8>, !torch.vtensor<[4,3],!torch.qint8> -> !torch.vtensor<[2,3],si32>
+  // CHECK: %[[ONE:.+]] = torch.constant.int 1
+  // CHECK: %[[ACC:.+]] = torch.aten.add.Tensor %[[MM]], %arg6, %[[ONE]] : !torch.vtensor<[2,3],si32>, !torch.vtensor<[3],si32>, !torch.int -> !torch.vtensor<[2,3],si32>
+  // CHECK: %[[ACCSCALE:.+]] = torch.aten.mul.float %[[ASCALE]], %[[BSCALE]] : !torch.float, !torch.float -> !torch.float
+  // CHECK: %[[ZERO:.+]] = torch.constant.int 0
+  // CHECK: %[[QACC:.+]] = torch.aten._make_per_tensor_quantized_tensor %[[ACC]], %[[ACCSCALE]], %[[ZERO]] : !torch.vtensor<[2,3],si32>, !torch.float, !torch.int -> !torch.vtensor<[2,3],!torch.qint32>
+  // CHECK: %[[Y:.+]] = torch.aten.dequantize.self %[[QACC]] : !torch.vtensor<[2,3],!torch.qint32> -> !torch.vtensor<[2,3],f32>
+  // CHECK-DAG: %[[YSCALE:.+]] = torch.aten.item %arg7 : !torch.vtensor<[],f32> -> !torch.float
+  // CHECK-DAG: %[[YZP:.+]] = torch.aten.item %arg8 : !torch.vtensor<[],si8> -> !torch.int
+  // CHECK: %[[DTY:.+]] = torch.constant.int 12
+  // CHECK: %[[QY:.+]] = torch.aten.quantize_per_tensor %[[Y]], %[[YSCALE]], %[[YZP]], %[[DTY]] : !torch.vtensor<[2,3],f32>, !torch.float, !torch.int, !torch.int -> !torch.vtensor<[2,3],!torch.qint8>
+  // CHECK: %[[OUT:.+]] = torch.aten.int_repr %[[QY]] : !torch.vtensor<[2,3],!torch.qint8> -> !torch.vtensor<[2,3],si8>
+  // CHECK: return %[[OUT]]
+  return %0 : !torch.vtensor<[2,3],si8>
+}
+
+// -----
+
+// A ui8 operand is moved to si8 with its zero point lowered by 128.
+// CHECK-LABEL: @test_qgemm_u8s8
+func.func @test_qgemm_u8s8(%arg0: !torch.vtensor<[2,4],ui8>, %arg1: !torch.vtensor<[],f32>, %arg2: !torch.vtensor<[],ui8>, %arg3: !torch.vtensor<[4,3],si8>, %arg4: !torch.vtensor<[],f32>, %arg5: !torch.vtensor<[],si8>, %arg6: !torch.vtensor<[3],si32>, %arg7: !torch.vtensor<[],f32>, %arg8: !torch.vtensor<[],ui8>) -> !torch.vtensor<[2,3],ui8> attributes {torch.onnx_meta.opset_version = 10 : si64} {
+  %0 = torch.operator "onnx.QGemm"(%arg0, %arg1, %arg2, %arg3, %arg4, %arg5, %arg6, %arg7, %arg8) : (!torch.vtensor<[2,4],ui8>, !torch.vtensor<[],f32>, !torch.vtensor<[],ui8>, !torch.vtensor<[4,3],si8>, !torch.vtensor<[],f32>, !torch.vtensor<[],si8>, !torch.vtensor<[3],si32>, !torch.vtensor<[],f32>, !torch.vtensor<[],ui8>) -> !torch.vtensor<[2,3],ui8>
+  // CHECK-DAG: %[[ASCALE:.+]] = torch.aten.item %arg1 : !torch.vtensor<[],f32> -> !torch.float
+  // CHECK-DAG: %[[AZP:.+]] = torch.aten.item %arg2 : !torch.vtensor<[],ui8> -> !torch.int
+  // CHECK: %[[C128:.+]] = torch.constant.int 128
+  // CHECK: %[[WIDE:.+]] = torch.aten.to.dtype %arg0, %{{.+}} : !torch.vtensor<[2,4],ui8>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[2,4],si32>
+  // CHECK: %[[SHIFTED:.+]] = torch.aten.sub.Scalar %[[WIDE]], %[[C128]], %{{.+}} : !torch.vtensor<[2,4],si32>, !torch.int, !torch.int -> !torch.vtensor<[2,4],si32>
+  // CHECK: %[[ASI8:.+]] = torch.aten.to.dtype %[[SHIFTED]], %{{.+}} : !torch.vtensor<[2,4],si32>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[2,4],si8>
+  // CHECK: %[[AZPSI8:.+]] = torch.aten.sub.int %[[AZP]], %[[C128]] : !torch.int, !torch.int -> !torch.int
+  // CHECK: %[[A:.+]] = torch.aten._make_per_tensor_quantized_tensor %[[ASI8]], %[[ASCALE]], %[[AZPSI8]] : !torch.vtensor<[2,4],si8>, !torch.float, !torch.int -> !torch.vtensor<[2,4],!torch.qint8>
+  // CHECK: %[[B:.+]] = torch.aten._make_per_tensor_quantized_tensor %arg3, %{{.+}}, %{{.+}} : !torch.vtensor<[4,3],si8>, !torch.float, !torch.int -> !torch.vtensor<[4,3],!torch.qint8>
+  // CHECK: %[[MM:.+]] = torch.aten.mm %[[A]], %[[B]] : !torch.vtensor<[2,4],!torch.qint8>, !torch.vtensor<[4,3],!torch.qint8> -> !torch.vtensor<[2,3],si32>
+  // CHECK: torch.aten.add.Tensor %[[MM]], %arg6
+  // CHECK: %[[Y:.+]] = torch.aten.dequantize.self %{{.+}} : !torch.vtensor<[2,3],!torch.qint32> -> !torch.vtensor<[2,3],f32>
+  // CHECK: %[[DTY:.+]] = torch.constant.int 13
+  // CHECK: %[[QY:.+]] = torch.aten.quantize_per_tensor %[[Y]], %{{.+}}, %{{.+}}, %[[DTY]] : !torch.vtensor<[2,3],f32>, !torch.float, !torch.int, !torch.int -> !torch.vtensor<[2,3],!torch.quint8>
+  // CHECK: %[[OUT:.+]] = torch.aten.int_repr %[[QY]] : !torch.vtensor<[2,3],!torch.quint8> -> !torch.vtensor<[2,3],ui8>
+  // CHECK: return %[[OUT]]
+  return %0 : !torch.vtensor<[2,3],ui8>
+}
+
+// -----
+
+// No bias: C is a `none` operand, y_scale and y_zero_point stay at 7 and 8.
+// CHECK-LABEL: @test_qgemm_nobias
+func.func @test_qgemm_nobias(%arg0: !torch.vtensor<[2,4],si8>, %arg1: !torch.vtensor<[],f32>, %arg2: !torch.vtensor<[],si8>, %arg3: !torch.vtensor<[4,3],si8>, %arg4: !torch.vtensor<[],f32>, %arg5: !torch.vtensor<[],si8>, %arg6: !torch.vtensor<[],f32>, %arg7: !torch.vtensor<[],si8>) -> !torch.vtensor<[2,3],si8> attributes {torch.onnx_meta.opset_version = 10 : si64} {
+  %none = torch.constant.none
+  %0 = torch.operator "onnx.QGemm"(%arg0, %arg1, %arg2, %arg3, %arg4, %arg5, %none, %arg6, %arg7) : (!torch.vtensor<[2,4],si8>, !torch.vtensor<[],f32>, !torch.vtensor<[],si8>, !torch.vtensor<[4,3],si8>, !torch.vtensor<[],f32>, !torch.vtensor<[],si8>, !torch.none, !torch.vtensor<[],f32>, !torch.vtensor<[],si8>) -> !torch.vtensor<[2,3],si8>
+  // CHECK: %[[MM:.+]] = torch.aten.mm %{{.+}}, %{{.+}} : !torch.vtensor<[2,4],!torch.qint8>, !torch.vtensor<[4,3],!torch.qint8> -> !torch.vtensor<[2,3],si32>
+  // CHECK-NOT: torch.aten.add.Tensor
+  // CHECK: %[[QACC:.+]] = torch.aten._make_per_tensor_quantized_tensor %[[MM]], %{{.+}}, %{{.+}} : !torch.vtensor<[2,3],si32>, !torch.float, !torch.int -> !torch.vtensor<[2,3],!torch.qint32>
+  // CHECK: %[[Y:.+]] = torch.aten.dequantize.self %[[QACC]] : !torch.vtensor<[2,3],!torch.qint32> -> !torch.vtensor<[2,3],f32>
+  // CHECK-DAG: %[[YSCALE:.+]] = torch.aten.item %arg6 : !torch.vtensor<[],f32> -> !torch.float
+  // CHECK-DAG: %[[YZP:.+]] = torch.aten.item %arg7 : !torch.vtensor<[],si8> -> !torch.int
+  // CHECK: %[[QY:.+]] = torch.aten.quantize_per_tensor %[[Y]], %[[YSCALE]], %[[YZP]], %{{.+}} : !torch.vtensor<[2,3],f32>, !torch.float, !torch.int, !torch.int -> !torch.vtensor<[2,3],!torch.qint8>
+  // CHECK: %[[OUT:.+]] = torch.aten.int_repr %[[QY]] : !torch.vtensor<[2,3],!torch.qint8> -> !torch.vtensor<[2,3],si8>
+  // CHECK: return %[[OUT]]
+  return %0 : !torch.vtensor<[2,3],si8>
+}
+
+// -----
+
+// Without y_scale and y_zero_point the result is the dequantized f32 value.
+// CHECK-LABEL: @test_qgemm_float_output
+func.func @test_qgemm_float_output(%arg0: !torch.vtensor<[2,4],si8>, %arg1: !torch.vtensor<[],f32>, %arg2: !torch.vtensor<[],si8>, %arg3: !torch.vtensor<[4,3],si8>, %arg4: !torch.vtensor<[],f32>, %arg5: !torch.vtensor<[],si8>, %arg6: !torch.vtensor<[3],si32>) -> !torch.vtensor<[2,3],f32> attributes {torch.onnx_meta.opset_version = 10 : si64} {
+  %0 = torch.operator "onnx.QGemm"(%arg0, %arg1, %arg2, %arg3, %arg4, %arg5, %arg6) : (!torch.vtensor<[2,4],si8>, !torch.vtensor<[],f32>, !torch.vtensor<[],si8>, !torch.vtensor<[4,3],si8>, !torch.vtensor<[],f32>, !torch.vtensor<[],si8>, !torch.vtensor<[3],si32>) -> !torch.vtensor<[2,3],f32>
+  // CHECK: %[[ACC:.+]] = torch.aten.add.Tensor %{{.+}}, %arg6, %{{.+}} : !torch.vtensor<[2,3],si32>, !torch.vtensor<[3],si32>, !torch.int -> !torch.vtensor<[2,3],si32>
+  // CHECK: %[[QACC:.+]] = torch.aten._make_per_tensor_quantized_tensor %[[ACC]], %{{.+}}, %{{.+}} : !torch.vtensor<[2,3],si32>, !torch.float, !torch.int -> !torch.vtensor<[2,3],!torch.qint32>
+  // CHECK: %[[Y:.+]] = torch.aten.dequantize.self %[[QACC]] : !torch.vtensor<[2,3],!torch.qint32> -> !torch.vtensor<[2,3],f32>
+  // CHECK-NOT: torch.aten.quantize_per_tensor
+  // CHECK: return %[[Y]] : !torch.vtensor<[2,3],f32>
+  return %0 : !torch.vtensor<[2,3],f32>
+}
+
+// -----
+
+// CHECK-LABEL: @test_qgemm_transB
+func.func @test_qgemm_transB(%arg0: !torch.vtensor<[2,4],si8>, %arg1: !torch.vtensor<[],f32>, %arg2: !torch.vtensor<[],si8>, %arg3: !torch.vtensor<[3,4],si8>, %arg4: !torch.vtensor<[],f32>, %arg5: !torch.vtensor<[],si8>, %arg6: !torch.vtensor<[3],si32>, %arg7: !torch.vtensor<[],f32>, %arg8: !torch.vtensor<[],si8>) -> !torch.vtensor<[2,3],si8> attributes {torch.onnx_meta.opset_version = 10 : si64} {
+  %0 = torch.operator "onnx.QGemm"(%arg0, %arg1, %arg2, %arg3, %arg4, %arg5, %arg6, %arg7, %arg8) {torch.onnx.transB = 1 : si64} : (!torch.vtensor<[2,4],si8>, !torch.vtensor<[],f32>, !torch.vtensor<[],si8>, !torch.vtensor<[3,4],si8>, !torch.vtensor<[],f32>, !torch.vtensor<[],si8>, !torch.vtensor<[3],si32>, !torch.vtensor<[],f32>, !torch.vtensor<[],si8>) -> !torch.vtensor<[2,3],si8>
+  // CHECK: %[[DIM0:.+]] = torch.constant.int 0
+  // CHECK: %[[DIM1:.+]] = torch.constant.int 1
+  // CHECK: %[[BT:.+]] = torch.aten.transpose.int %arg3, %[[DIM0]], %[[DIM1]] : !torch.vtensor<[3,4],si8>, !torch.int, !torch.int -> !torch.vtensor<[4,3],si8>
+  // CHECK: %[[B:.+]] = torch.aten._make_per_tensor_quantized_tensor %[[BT]], %{{.+}}, %{{.+}} : !torch.vtensor<[4,3],si8>, !torch.float, !torch.int -> !torch.vtensor<[4,3],!torch.qint8>
+  // CHECK: torch.aten.mm %{{.+}}, %[[B]] : !torch.vtensor<[2,4],!torch.qint8>, !torch.vtensor<[4,3],!torch.qint8> -> !torch.vtensor<[2,3],si32>
+  return %0 : !torch.vtensor<[2,3],si8>
+}
+
+// -----
+
+// alpha scales the accumulator after the bias has joined it, as in
+// onnxruntime.
+// CHECK-LABEL: @test_qgemm_alpha
+func.func @test_qgemm_alpha(%arg0: !torch.vtensor<[2,4],si8>, %arg1: !torch.vtensor<[],f32>, %arg2: !torch.vtensor<[],si8>, %arg3: !torch.vtensor<[4,3],si8>, %arg4: !torch.vtensor<[],f32>, %arg5: !torch.vtensor<[],si8>, %arg6: !torch.vtensor<[3],si32>, %arg7: !torch.vtensor<[],f32>, %arg8: !torch.vtensor<[],si8>) -> !torch.vtensor<[2,3],si8> attributes {torch.onnx_meta.opset_version = 10 : si64} {
+  %0 = torch.operator "onnx.QGemm"(%arg0, %arg1, %arg2, %arg3, %arg4, %arg5, %arg6, %arg7, %arg8) {torch.onnx.alpha = 5.000000e-01 : f32} : (!torch.vtensor<[2,4],si8>, !torch.vtensor<[],f32>, !torch.vtensor<[],si8>, !torch.vtensor<[4,3],si8>, !torch.vtensor<[],f32>, !torch.vtensor<[],si8>, !torch.vtensor<[3],si32>, !torch.vtensor<[],f32>, !torch.vtensor<[],si8>) -> !torch.vtensor<[2,3],si8>
+  // CHECK: torch.aten.add.Tensor %{{.+}}, %arg6, %{{.+}} : !torch.vtensor<[2,3],si32>, !torch.vtensor<[3],si32>, !torch.int -> !torch.vtensor<[2,3],si32>
+  // CHECK: %[[Y:.+]] = torch.aten.dequantize.self %{{.+}} : !torch.vtensor<[2,3],!torch.qint32> -> !torch.vtensor<[2,3],f32>
+  // CHECK: %[[ALPHA:.+]] = torch.constant.float 5.000000e-01
+  // CHECK: %[[YA:.+]] = torch.aten.mul.Scalar %[[Y]], %[[ALPHA]] : !torch.vtensor<[2,3],f32>, !torch.float -> !torch.vtensor<[2,3],f32>
+  // CHECK: torch.aten.quantize_per_tensor %[[YA]], %{{.+}}, %{{.+}}, %{{.+}} : !torch.vtensor<[2,3],f32>, !torch.float, !torch.int, !torch.int -> !torch.vtensor<[2,3],!torch.qint8>
+  return %0 : !torch.vtensor<[2,3],si8>
+}
+
+// -----
+
+// Per-column b_scale and b_zero_point: the product of the dequantized f32
+// inputs, and the bias dequantized with a_scale * b_scale[n].
+// CHECK-LABEL: @test_qgemm_per_column
+func.func @test_qgemm_per_column(%arg0: !torch.vtensor<[2,4],ui8>, %arg1: !torch.vtensor<[],f32>, %arg2: !torch.vtensor<[],ui8>, %arg3: !torch.vtensor<[4,3],si8>, %arg4: !torch.vtensor<[3],f32>, %arg5: !torch.vtensor<[3],si8>, %arg6: !torch.vtensor<[3],si32>, %arg7: !torch.vtensor<[],f32>, %arg8: !torch.vtensor<[],ui8>) -> !torch.vtensor<[2,3],ui8> attributes {torch.onnx_meta.opset_version = 10 : si64} {
+  %0 = torch.operator "onnx.QGemm"(%arg0, %arg1, %arg2, %arg3, %arg4, %arg5, %arg6, %arg7, %arg8) : (!torch.vtensor<[2,4],ui8>, !torch.vtensor<[],f32>, !torch.vtensor<[],ui8>, !torch.vtensor<[4,3],si8>, !torch.vtensor<[3],f32>, !torch.vtensor<[3],si8>, !torch.vtensor<[3],si32>, !torch.vtensor<[],f32>, !torch.vtensor<[],ui8>) -> !torch.vtensor<[2,3],ui8>
+  // CHECK-DAG: %[[ASCALE:.+]] = torch.aten.item %arg1 : !torch.vtensor<[],f32> -> !torch.float
+  // CHECK-DAG: %[[AZP:.+]] = torch.aten.item %arg2 : !torch.vtensor<[],ui8> -> !torch.int
+  // CHECK: %[[AF:.+]] = torch.aten.to.dtype %arg0, %{{.+}} : !torch.vtensor<[2,4],ui8>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[2,4],f32>
+  // CHECK: %[[AS:.+]] = torch.aten.sub.Scalar %[[AF]], %[[AZP]], %{{.+}} : !torch.vtensor<[2,4],f32>, !torch.int, !torch.float -> !torch.vtensor<[2,4],f32>
+  // CHECK: %[[A:.+]] = torch.aten.mul.Scalar %[[AS]], %[[ASCALE]] : !torch.vtensor<[2,4],f32>, !torch.float -> !torch.vtensor<[2,4],f32>
+  // CHECK: %[[BF:.+]] = torch.aten.to.dtype %arg3, %{{.+}} : !torch.vtensor<[4,3],si8>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[4,3],f32>
+  // CHECK: %[[BS:.+]] = torch.aten.sub.Tensor %[[BF]], %arg5, %{{.+}} : !torch.vtensor<[4,3],f32>, !torch.vtensor<[3],si8>, !torch.float -> !torch.vtensor<[4,3],f32>
+  // CHECK: %[[B:.+]] = torch.aten.mul.Tensor %[[BS]], %arg4 : !torch.vtensor<[4,3],f32>, !torch.vtensor<[3],f32> -> !torch.vtensor<[4,3],f32>
+  // CHECK: %[[MM:.+]] = torch.aten.mm %[[A]], %[[B]] : !torch.vtensor<[2,4],f32>, !torch.vtensor<[4,3],f32> -> !torch.vtensor<[2,3],f32>
+  // CHECK: %[[CF:.+]] = torch.aten.to.dtype %arg6, %{{.+}} : !torch.vtensor<[3],si32>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[3],f32>
+  // CHECK: %[[CA:.+]] = torch.aten.mul.Scalar %[[CF]], %[[ASCALE]] : !torch.vtensor<[3],f32>, !torch.float -> !torch.vtensor<[3],f32>
+  // CHECK: %[[CB:.+]] = torch.aten.mul.Tensor %[[CA]], %arg4 : !torch.vtensor<[3],f32>, !torch.vtensor<[3],f32> -> !torch.vtensor<[3],f32>
+  // CHECK: %[[Y:.+]] = torch.aten.add.Tensor %[[MM]], %[[CB]], %{{.+}} : !torch.vtensor<[2,3],f32>, !torch.vtensor<[3],f32>, !torch.float -> !torch.vtensor<[2,3],f32>
+  // CHECK: %[[DTY:.+]] = torch.constant.int 13
+  // CHECK: %[[QY:.+]] = torch.aten.quantize_per_tensor %[[Y]], %{{.+}}, %{{.+}}, %[[DTY]] : !torch.vtensor<[2,3],f32>, !torch.float, !torch.int, !torch.int -> !torch.vtensor<[2,3],!torch.quint8>
+  // CHECK: %[[OUT:.+]] = torch.aten.int_repr %[[QY]] : !torch.vtensor<[2,3],!torch.quint8> -> !torch.vtensor<[2,3],ui8>
+  // CHECK: return %[[OUT]]
+  return %0 : !torch.vtensor<[2,3],ui8>
+}
+
+// -----
+
 // CHECK-LABEL: @test_qlinearconv_nobias
 func.func @test_qlinearconv_nobias(%arg0: !torch.vtensor<[1,1,7,7],ui8>, %arg1: !torch.vtensor<[],f32>, %arg2: !torch.vtensor<[],ui8>, %arg3: !torch.vtensor<[1,1,1,1],ui8>, %arg4: !torch.vtensor<[1],f32>, %arg5: !torch.vtensor<[1],ui8>, %arg6: !torch.vtensor<[],f32>, %arg7: !torch.vtensor<[],ui8>) -> !torch.vtensor<[1,1,7,7],ui8> attributes {torch.onnx_meta.ir_version = 5 : si64, torch.onnx_meta.opset_version = 10 : si64, torch.onnx_meta.producer_name = "backend-test", torch.onnx_meta.producer_version = ""} {
   %0 = torch.operator "onnx.QLinearConv"(%arg0, %arg1, %arg2, %arg3, %arg4, %arg5, %arg6, %arg7) : (!torch.vtensor<[1,1,7,7],ui8>, !torch.vtensor<[],f32>, !torch.vtensor<[],ui8>, !torch.vtensor<[1,1,1,1],ui8>, !torch.vtensor<[1],f32>, !torch.vtensor<[1],ui8>, !torch.vtensor<[],f32>, !torch.vtensor<[],ui8>) -> !torch.vtensor<[1,1,7,7],ui8>
